@@ -1,0 +1,315 @@
+#include "raylib.h"
+#include "raymath.h"
+#include "rlgl.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+
+typedef struct {
+  bool show_wireframe;
+  bool show_grid;
+  bool show_help;
+  bool show_fps;
+} Settings;
+
+typedef struct {
+  Vector3 position;
+  float radius;
+  Vector3 velocity;
+  float mass;
+} Particle;
+
+typedef struct {
+  Vector3 position;
+  float radius;
+  float mass;
+} Sphere;
+
+#define MAX_PARTICLES 100
+#define GRAVITY_CONSTANT 1.0f
+#define FONT_SIZE 20
+
+typedef struct {
+  Vector3 position;
+  float radius;
+  Color color;
+  Vector3 velocity;
+  float mass;
+} ParticleInstance;
+
+void ApplyGravity(Particle *particle, Sphere sphere) {
+  Vector3 direction = Vector3Subtract(sphere.position, particle->position);
+  float distance = Vector3Length(direction);
+
+  if (distance > 0) {
+    float forceMagnitude = (GRAVITY_CONSTANT * sphere.mass * particle->mass) /
+                           (distance * distance);
+    Vector3 force = Vector3Scale(Vector3Normalize(direction), forceMagnitude);
+
+    particle->velocity = Vector3Add(particle->velocity, force);
+  }
+}
+
+void ApplyGravityToInstance(ParticleInstance *particle, Sphere sphere) {
+  Vector3 direction = Vector3Subtract(sphere.position, particle->position);
+  float distance = Vector3Length(direction);
+
+  if (distance > 0) {
+    float forceMagnitude = (GRAVITY_CONSTANT * sphere.mass * particle->mass) /
+                           (distance * distance);
+    Vector3 force = Vector3Scale(Vector3Normalize(direction), forceMagnitude);
+
+    particle->velocity = Vector3Add(particle->velocity, force);
+  }
+}
+
+void SetupInstancedBuffer(Model *model, ParticleInstance *instances, int instanceCount) {
+  // Generate a buffer for the instance data
+  unsigned int instanceVBO =
+      rlLoadVertexBuffer(instances, instanceCount * sizeof(ParticleInstance), false);
+
+  // Bind the VAO of the model's mesh
+  rlEnableVertexArray(model->meshes[0].vaoId);
+
+  // Set up vertex attributes for instancing
+  // Instance position (location = 1)
+  rlEnableVertexAttribute(1);
+  rlSetVertexAttribute(1, 3, RL_FLOAT, false, sizeof(ParticleInstance),
+                       (int)offsetof(ParticleInstance, position)); // Cast offset to int
+  rlSetVertexAttributeDivisor(1, 1); // Tell OpenGL this is an instanced vertex attribute
+
+  // Instance radius (location = 2)
+  rlEnableVertexAttribute(2);
+  rlSetVertexAttribute(2, 1, RL_FLOAT, false, sizeof(ParticleInstance),
+                       (int)offsetof(ParticleInstance, radius)); // Cast offset to int
+  rlSetVertexAttributeDivisor(2, 1);
+
+  // Instance color (location = 3)
+  rlEnableVertexAttribute(3);
+  rlSetVertexAttribute(3, 4, RL_FLOAT, false, sizeof(ParticleInstance),
+                       (int)offsetof(ParticleInstance, color)); // Cast offset to int
+  rlSetVertexAttributeDivisor(3, 1);
+
+  // Unbind the VAO to avoid accidental modifications
+  rlDisableVertexArray();
+}
+
+//------------------------------------------------------------------------------------
+// Program main entry point
+//------------------------------------------------------------------------------------
+int main(void) {
+  // Initialization
+  //--------------------------------------------------------------------------------------
+
+  // Make window the size of 720p
+  const int screenWidth = 1280;
+  const int screenHeight = 720;
+
+  InitWindow(screenWidth, screenHeight,
+             "raylib [core] example - 3d camera free");
+
+  Settings settings = {
+      false,
+      false,
+      false,
+      true,
+  };
+
+  Sphere black_hole = {
+      (Vector3){0.0f, 0.0f, 0.0f},
+      1.0f,
+      1.0f,
+  };
+
+  // Particle particles[MAX_PARTICLES];
+  // for (int i = 0; i < MAX_PARTICLES; i++) {
+  //   particles[i].position = (Vector3){
+  //       GetRandomValue(0, 10), GetRandomValue(0, 10), GetRandomValue(2, 10)};
+  //   particles[i].radius = 0.3f;
+  //   particles[i].velocity = (Vector3){0, 0, 0};
+  //   particles[i].mass = 0.3f;
+  // }
+
+  // Initialize particle instances
+  ParticleInstance instances[MAX_PARTICLES];
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    instances[i].position = (Vector3){
+        GetRandomValue(0, 10), GetRandomValue(0, 10), GetRandomValue(2, 10)};
+    instances[i].radius = 0.3f;
+    instances[i].color = RED;
+    instances[i].velocity = (Vector3){0, 0, 0};
+    instances[i].mass = 0.3f;
+  }
+
+  // Create a sphere mesh and model
+  Mesh sphereMesh = GenMeshSphere(0.3f, 16, 16); // Create a sphere mesh
+  printf("Sphere mesh vertex count: %d\n", sphereMesh.vertexCount);
+  Model sphereModel =
+      LoadModelFromMesh(sphereMesh); // Load the mesh into a model
+
+  // Set up the instanced buffer
+  SetupInstancedBuffer(&sphereModel, instances, MAX_PARTICLES);
+
+  // Load shaders
+  Shader instancingShader = LoadShader("instancing.vert", "instancing.frag");
+  if (instancingShader.id == 0) {
+      TraceLog(LOG_ERROR, "Failed to load shader!");
+  }
+
+  // Set anti-aliasing to 4x MSAA
+  SetConfigFlags(FLAG_MSAA_4X_HINT);
+
+  // Define the camera to look into our 3d world
+  Camera3D camera = {0};
+  camera.position = (Vector3){10.0f, 10.0f, 10.0f}; // Camera position
+  camera.target = (Vector3){0.0f, 0.0f, 0.0f};      // Camera looking at point
+  camera.up =
+      (Vector3){0.0f, 1.0f, 0.0f}; // Camera up vector (rotation towards target)
+  camera.fovy = 45.0f;             // Camera field-of-view Y
+  camera.projection = CAMERA_PERSPECTIVE; // Camera projection type
+
+  DisableCursor(); // Limit cursor to relative movement inside the window
+
+  // Initialize last fps as 0
+  int lastFPS = 0;
+  // Give the text buffer space for 10 chars FPS and value of 3 digits + null
+  // terminator
+  char fpsText[10];
+
+  SetTargetFPS(60); // Set our game to run at 60 frames-per-second
+  //--------------------------------------------------------------------------------------
+
+  // Main game loop
+  while (!WindowShouldClose()) // Detect window close button or ESC key
+  {
+    // Update
+    //----------------------------------------------------------------------------------
+
+    int currentFPS = GetFPS();
+
+    // Only update the FPS text if the FPS value has changed
+    if (currentFPS != lastFPS) {
+      TextFormat(fpsText, sizeof(fpsText), "FPS: %d", currentFPS);
+      lastFPS = currentFPS;
+    }
+
+    UpdateCamera(&camera, CAMERA_FREE);
+
+    if (IsKeyPressed('Z'))
+      camera.target = (Vector3){0.0f, 0.0f, 0.0f};
+
+    if (IsKeyPressed('V')) {
+      settings.show_wireframe = !settings.show_wireframe;
+    }
+
+    if (IsKeyPressed('G')) {
+      settings.show_grid = !settings.show_grid;
+    }
+
+    if (IsKeyPressed(KEY_F1)) {
+      settings.show_help = !settings.show_help;
+    }
+
+    if (IsKeyPressed(KEY_F2)) {
+      settings.show_fps = !settings.show_fps;
+      printf("Show FPS: %s\n",
+             settings.show_fps ? "ON" : "OFF"); // Debug print to check toggle
+    }
+
+    // Apply gravity to particles
+    // for (int i = 0; i < MAX_PARTICLES; i++) {
+    //   ApplyGravity(&particles[i], black_hole);
+    //   particles[i].position =
+    //       Vector3Add(particles[i].position, particles[i].velocity);
+    // }
+
+    // In the main loop (if particles move)
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+      ApplyGravityToInstance(&instances[i], black_hole);
+      instances[i].position =
+          Vector3Add(instances[i].position, instances[i].velocity);
+      instances[i].position = instances[i].position;
+    }
+
+    // Update the instance buffer with new particle positions
+    rlUpdateVertexBuffer(*sphereModel.meshes[0].vboId, instances, MAX_PARTICLES * sizeof(ParticleInstance), 0);
+
+    // Create an array of matrices for the particle transforms
+    Matrix transforms[MAX_PARTICLES];
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        transforms[i] = MatrixTranslate(instances[i].position.x, instances[i].position.y, instances[i].position.z);
+    }
+
+    //----------------------------------------------------------------------------------
+    // Draw
+    //----------------------------------------------------------------------------------
+    BeginDrawing();
+
+    ClearBackground(GRAY);
+
+    BeginMode3D(camera);
+
+    // DrawSphere(black_hole.position, black_hole.radius, BLACK);
+
+    // DrawMesh(sphereModel.meshes[0], sphereModel.materials[0], MatrixIdentity());
+
+
+    // DrawMesh(cubeModel.meshes[0], cubeModel.materials[0], MatrixIdentity());
+
+    // for (int i = 0; i < MAX_PARTICLES; i++) {
+    //   DrawCircle3D(particles[i].position, particles[i].radius, (Vector3){0,
+    //   0, 0}, 0.0f, RED);
+    //   DrawSphere(particles[i].position, particles[i].radius, RED);
+
+    //   ---- DON'T DO THIS ----
+    //   DrawSphere(instances[i].position, instances[i].radius, RED);
+    // }
+
+    // rlDisableDepthTest();
+    // Draw the instanced particles
+    DrawMeshInstanced(sphereModel.meshes[0], sphereModel.materials[0], transforms, MAX_PARTICLES);
+    // rlEnableDepthTest();
+
+    if (settings.show_wireframe) {
+      DrawSphereWires(black_hole.position, black_hole.radius, 16, 16, WHITE);
+    }
+
+    if (settings.show_grid) {
+      DrawGrid(10, 1.0f);
+    }
+
+    EndMode3D();
+
+    if (settings.show_fps) {
+      DrawFPS(20, 20);
+      // printf("FPS: %d\n", currentFPS);
+    }
+
+    if (settings.show_help) {
+      // DrawRectangle(10, 10, 320, 93, Fade(SKYBLUE, 0.5f));
+      // DrawRectangleLines(10, 10, 320, 93, BLUE);
+
+      // DrawText("Free camera default controls:", 20, 20, 10, BLACK);
+      // DrawText("- Mouse Wheel to Zoom in-out", 40, 40, 10, DARKGRAY);
+      // DrawText("- Mouse Wheel Pressed to Pan", 40, 60, 10, DARKGRAY);
+      // DrawText("- Z to zoom to (0, 0, 0)", 40, 80, 10, DARKGRAY);
+      // DrawText(fpsText, 20, 20, 10, RED);
+      DrawText("Controls:", 20, 40, FONT_SIZE, BLACK);
+      DrawText("- V to toggle wireframe", 40, 60, FONT_SIZE, DARKGRAY);
+      DrawText("- G to toggle grid", 40, 80, FONT_SIZE, DARKGRAY);
+      DrawText("- F1 to toggle this help", 40, 100, FONT_SIZE, DARKGRAY);
+      DrawText("- F2 to toggle FPS", 40, 120, FONT_SIZE, DARKGRAY);
+      DrawText("- ESC to exit", 40, 140, FONT_SIZE, DARKGRAY);
+    }
+
+    EndDrawing();
+    //----------------------------------------------------------------------------------
+  }
+
+  // De-Initialization
+  //--------------------------------------------------------------------------------------
+  CloseWindow(); // Close window and OpenGL context
+  //--------------------------------------------------------------------------------------
+
+  return 0;
+}
